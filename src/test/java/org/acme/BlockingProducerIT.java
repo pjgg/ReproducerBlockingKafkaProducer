@@ -1,12 +1,10 @@
 package org.acme;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.time.Duration;
 import java.util.Map;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 
-import org.apache.http.HttpStatus;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
@@ -17,19 +15,21 @@ import io.quarkus.test.bootstrap.RestService;
 import io.quarkus.test.scenarios.QuarkusScenario;
 import io.quarkus.test.services.QuarkusApplication;
 import io.smallrye.mutiny.Uni;
+import io.smallrye.mutiny.helpers.test.UniAssertSubscriber;
 import io.vertx.ext.web.client.WebClientOptions;
 import io.vertx.mutiny.core.Vertx;
-import io.vertx.mutiny.core.buffer.Buffer;
-import io.vertx.mutiny.ext.web.client.HttpResponse;
 import io.vertx.mutiny.ext.web.client.WebClient;
-import io.vertx.mutiny.ext.web.client.predicate.ResponsePredicate;
 
 @Tag("QUARKUS-1090")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 @QuarkusScenario
 public class BlockingProducerIT {
-    private static final int TIMEOUT_SEC = 80;
-    private static final int EVENTS = 3;
+    private static final int TIMEOUT_SEC = 5;
+    private static final int EVENTS = 100;
+    static final long KAFKA_MAX_BLOCK_MS = 100;
+    static final long DEVIATION_ERROR_MS = 80;
+    static final long KAFKA_MAX_BLOCK_TIME_MS = KAFKA_MAX_BLOCK_MS + DEVIATION_ERROR_MS;
+
     static CustomStrimziKafkaContainer kafkaContainer;
 
     WebClient httpClient;
@@ -46,7 +46,6 @@ public class BlockingProducerIT {
     @BeforeEach
     public void setup() {
         httpClient = WebClient.create(Vertx.vertx(), new WebClientOptions());
-        System.out.println("App Listening: " + app.getPort());
     }
 
     @AfterAll
@@ -55,46 +54,45 @@ public class BlockingProducerIT {
     }
 
     @Test
-    public void kafkaClientsBlocksIfTopicsNotExistWithMetadata() throws InterruptedException {
-        CountDownLatch done = new CountDownLatch(EVENTS);
+    public void kafkaProducerBlocksIfTopicsNotExistWithMetadata() {
+        UniAssertSubscriber<Integer> subscriber = makeHttpReqAsJson(httpClient, "/event/tooLongToExist")
+                .subscribe().withSubscriber(UniAssertSubscriber.create());
 
-        for (int i = 0; i < EVENTS; i++) {
-            makeHttpReqAsJson(httpClient, "/event/tooLongToExist", HttpStatus.SC_OK).subscribe().with(success -> {
-                assertEquals(success, "success");
-                done.countDown();
-            });
-        }
-
-        done.await(TIMEOUT_SEC, TimeUnit.SECONDS);
-        assertEquals(0, done.getCount(), String.format("Missing %d events.", EVENTS - done.getCount()));
+        int reqTime = subscriber.awaitItem(Duration.ofSeconds(TIMEOUT_SEC)).getItem();
+        assertTrue(reqTime < KAFKA_MAX_BLOCK_TIME_MS, getErrorMsg(reqTime));
     }
 
     @Test
-    public void kafkaClientsBlocksIfTopicsNotExistEmitterWithoutMetadata() throws InterruptedException {
-        CountDownLatch done = new CountDownLatch(EVENTS);
+    public void kafkaProducerBlocksIfTopicsNotExistEmitterWithoutMetadata() {
 
+        UniAssertSubscriber<Integer> subscriber = makeHttpReqAsJson(httpClient, "/event")
+                .subscribe().withSubscriber(UniAssertSubscriber.create());
+
+        int reqTime = subscriber.awaitItem(Duration.ofSeconds(TIMEOUT_SEC)).getItem();
+        assertTrue(reqTime < KAFKA_MAX_BLOCK_TIME_MS, getErrorMsg(reqTime));
+    }
+
+    @Test
+    public void severalEventsProducedKeepResponseTimes() {
         for (int i = 0; i < EVENTS; i++) {
-            makeHttpReqAsJson(httpClient, "/event", HttpStatus.SC_OK).subscribe().with(success -> {
-                assertEquals(success, "success");
-                done.countDown();
-            });
+            UniAssertSubscriber<Integer> subscriber = makeHttpReqAsJson(httpClient, "/event")
+                    .subscribe().withSubscriber(UniAssertSubscriber.create());
+
+            int reqTime = subscriber.awaitItem(Duration.ofSeconds(TIMEOUT_SEC)).getItem();
+            assertTrue(reqTime < KAFKA_MAX_BLOCK_TIME_MS, getErrorMsg(reqTime));
         }
-
-        done.await(TIMEOUT_SEC, TimeUnit.SECONDS);
-        assertEquals(0, done.getCount(), String.format("Missing %d events.", EVENTS - done.getCount()));
     }
 
-    private Uni<String> makeHttpReqAsJson(WebClient httpClient, String path, int expectedStatus) {
-        return makeHttpReq(httpClient, path, expectedStatus).map(HttpResponse::bodyAsString);
-    }
-
-    private Uni<HttpResponse<Buffer>> makeHttpReq(WebClient httpClient, String path, int expectedStatus) {
-        return httpClient.postAbs(getAppEndpoint() + path)
-                .expect(ResponsePredicate.status(expectedStatus))
-                .send();
+    private Uni<Integer> makeHttpReqAsJson(WebClient httpClient, String path) {
+        return httpClient.postAbs(getAppEndpoint() + path).send()
+                .map(resp -> Integer.parseInt(resp.getHeader("x-ms")));
     }
 
     private String getAppEndpoint() {
         return String.format("http://localhost:%d/", app.getPort());
+    }
+
+    private String getErrorMsg(long reqTime) {
+        return String.format("reqTime %d greater than KafkaMaxBlockMs %d", reqTime, KAFKA_MAX_BLOCK_TIME_MS);
     }
 }
